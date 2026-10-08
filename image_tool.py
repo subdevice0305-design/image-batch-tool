@@ -19,6 +19,18 @@ def parse_color(value):
         raise argparse.ArgumentTypeError(f"色は #rrggbb 形式で指定してください: {value}")
 
 
+def parse_ratio(value):
+    """'16:9' / '16x9' / '1.91:1' を (幅, 高さ) に変換"""
+    try:
+        a, b = value.lower().replace("x", ":").split(":")
+        a, b = float(a), float(b)
+        if a <= 0 or b <= 0:
+            raise ValueError
+        return a, b
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"比率は 16:9 のように指定してください: {value}")
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="画像の一括リサイズ・形式変換ツール(Pillowのみ)")
     p.add_argument("-i", "--input", type=Path, default=Path("input"), help="入力フォルダ (default: input)")
@@ -27,7 +39,11 @@ def parse_args():
                    help="長辺のサイズ。複数可。サイズごとにフォルダ分け (default: 800 400)")
     p.add_argument("-f", "--format", choices=list(FORMATS), default=None,
                    help="出力形式 (default: 元の形式のまま)")
-    p.add_argument("--square", action="store_true", help="正方形になるよう余白を足す")
+    p.add_argument("--ratio", type=parse_ratio, default=None,
+                   help="縦横比。例: 16:9 / 4:5 / 3:2 (default: 元の比率のまま)")
+    p.add_argument("--square", action="store_true", help="正方形にする (--ratio 1:1 と同じ)")
+    p.add_argument("--crop", action="store_true",
+                   help="余白を足さず、はみ出た部分を切り取って比率に合わせる (--ratio か --square と一緒に使う)")
     p.add_argument("--bg", type=parse_color, default=(255, 255, 255),
                    help="余白・塗りつぶしの色 (default: #ffffff)")
     p.add_argument("--flatten", action="store_true", help="透過部分を --bg の色で塗りつぶす (jpgは常に塗りつぶし)")
@@ -35,6 +51,10 @@ def parse_args():
     args = p.parse_args()
     if any(s <= 0 for s in args.sizes):
         p.error("サイズは1以上の整数で指定してください")
+    if args.square:
+        args.ratio = (1, 1)
+    if args.crop and args.ratio is None:
+        p.error("--crop は --ratio か --square と一緒に使ってください")
     return args
 
 
@@ -49,6 +69,14 @@ def is_opaque(img):
     return img.getchannel("A").getextrema() == (255, 255)
 
 
+def canvas_size(size, ratio):
+    """長辺が size になるキャンバスの (幅, 高さ)"""
+    rw, rh = ratio
+    if rw >= rh:
+        return size, max(1, round(size * rh / rw))
+    return max(1, round(size * rw / rh)), size
+
+
 def process(src, args):
     with Image.open(src) as img:
         img = ImageOps.exif_transpose(img).convert("RGBA")
@@ -57,14 +85,18 @@ def process(src, args):
             ext = "jpg"
 
         for size in args.sizes:
-            out = img.copy()
-            out.thumbnail((size, size))  # 縦横比を保って縮小
-
-            if args.square:
-                canvas = Image.new("RGBA", (size, size), args.bg + (255,))
-                pos = ((size - out.width) // 2, (size - out.height) // 2)
-                canvas.paste(out, pos, out)
-                out = canvas
+            if args.ratio and args.crop:
+                out = ImageOps.fit(img, canvas_size(size, args.ratio), Image.LANCZOS)
+            else:
+                out = img.copy()
+                out.thumbnail((size, size))  # 縦横比を保って縮小
+                if args.ratio:
+                    cw, ch = canvas_size(size, args.ratio)
+                    out.thumbnail((cw, ch))
+                    canvas = Image.new("RGBA", (cw, ch), args.bg + (255,))
+                    pos = ((cw - out.width) // 2, (ch - out.height) // 2)
+                    canvas.paste(out, pos, out)
+                    out = canvas
 
             if ext == "jpg" or args.flatten:
                 out = flatten(out, args.bg)
